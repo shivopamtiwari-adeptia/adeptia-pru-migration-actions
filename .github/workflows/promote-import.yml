@@ -130,16 +130,16 @@ jobs:
 
           BODY="## Migration Release
 
-| Field | Value |
-|---|---|
-| **Package** | ${{ steps.config.outputs.package_base }} |
-| **Environments** | ${{ steps.import.outputs.imported_envs }} |
-| **Release Date** | ${RELEASE_DATE} |
-| **PR** | [${{ github.event.pull_request.html_url }}](${{ github.event.pull_request.html_url }}) |
-| **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Field | Value |
+          |---|---|
+          | **Package** | ${{ steps.config.outputs.package_base }} |
+          | **Environments** | ${{ steps.import.outputs.imported_envs }} |
+          | **Release Date** | ${RELEASE_DATE} |
+          | **PR** | [${{ github.event.pull_request.html_url }}](${{ github.event.pull_request.html_url }}) |
+          | **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-### Rollback ZIPs
-${{ steps.import.outputs.rollback_zips }}"
+          ### Rollback ZIPs
+          ${{ steps.import.outputs.rollback_zips }}"
 
           PAYLOAD=$(python3 -c "
 import json, sys

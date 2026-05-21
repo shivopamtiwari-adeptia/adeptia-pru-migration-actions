@@ -134,17 +134,17 @@ jobs:
           TAG="${{ steps.resolve.outputs.package_base }}-${{ inputs.target_environment }}"
           BODY="## Migration Release
 
-| Field | Value |
-|---|---|
-| **Package** | ${{ steps.resolve.outputs.package_base }} |
-| **Imported To** | ${{ inputs.target_environment }} |
-| **Import Date** | ${RELEASE_DATE} |
-| **Source ZIP** | ${{ inputs.source_zip_name }} |
-| **Rollback ZIP** | ${{ steps.resolve.outputs.rollback_zip_name }} |
-| **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Field | Value |
+          |---|---|
+          | **Package** | ${{ steps.resolve.outputs.package_base }} |
+          | **Imported To** | ${{ inputs.target_environment }} |
+          | **Import Date** | ${RELEASE_DATE} |
+          | **Source ZIP** | ${{ inputs.source_zip_name }} |
+          | **Rollback ZIP** | ${{ steps.resolve.outputs.rollback_zip_name }} |
+          | **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-### Rollback
-Run the **Rollback workflow** and enter: ${{ steps.resolve.outputs.rollback_zip_name }}"
+          ### Rollback
+          Run the **Rollback workflow** and enter: ${{ steps.resolve.outputs.rollback_zip_name }}"
 
           PAYLOAD=$(python3 -c "
 import json, sys
