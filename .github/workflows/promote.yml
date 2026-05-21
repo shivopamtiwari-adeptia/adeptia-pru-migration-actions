@@ -148,23 +148,19 @@ jobs:
           # Create PR
           PR_BODY="## Promote Package
 
-| Field | Value |
-|---|---|
-| **Package** | ${{ steps.resolve.outputs.package_base }} |
-| **Export Env** | ${{ inputs.export_environment }} |
-| **Target Envs** | ${{ steps.resolve.outputs.target_envs }} |
-| **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Field | Value |
+          |---|---|
+          | **Package** | ${{ steps.resolve.outputs.package_base }} |
+          | **Export Env** | ${{ inputs.export_environment }} |
+          | **Target Envs** | ${{ steps.resolve.outputs.target_envs }} |
+          | **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-Merge this PR to trigger automatic import to: ${{ steps.resolve.outputs.target_envs }}"
+          Merge this PR to trigger automatic import to: ${{ steps.resolve.outputs.target_envs }}"
 
-          PAYLOAD=$(python3 -c "
-import json, sys
-print(json.dumps({
-  'title': 'Promote: ${{ steps.resolve.outputs.package_base }} -> ${{ steps.resolve.outputs.target_envs }}',
-  'head':  '${{ steps.resolve.outputs.pr_branch }}',
-  'base':  'main',
-  'body':  sys.argv[1]
-}))" "$PR_BODY")
+          PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'title':sys.argv[1],'head':sys.argv[2],'base':'main','body':sys.argv[3]}))" \
+            "Promote: ${{ steps.resolve.outputs.package_base }} -> ${{ steps.resolve.outputs.target_envs }}" \
+            "${{ steps.resolve.outputs.pr_branch }}" \
+            "$PR_BODY")
 
           RESPONSE=$(curl --insecure --silent -X POST \
             -H "Authorization: token ${{ secrets.GH_TOKEN }}" \

@@ -146,16 +146,10 @@ jobs:
           ### Rollback
           Run the **Rollback workflow** and enter: ${{ steps.resolve.outputs.rollback_zip_name }}"
 
-          PAYLOAD=$(python3 -c "
-import json, sys
-print(json.dumps({
-  'tag_name': '$TAG',
-  'target_commitish': 'main',
-  'name': '${{ steps.resolve.outputs.package_base }} -> ${{ inputs.target_environment }} (${RELEASE_DATE})',
-  'body': sys.argv[1],
-  'draft': False,
-  'prerelease': False
-}))" "$BODY")
+          PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'tag_name':sys.argv[1],'target_commitish':'main','name':sys.argv[2],'body':sys.argv[3],'draft':False,'prerelease':False}))" \
+            "$TAG" \
+            "${{ steps.resolve.outputs.package_base }} -> ${{ inputs.target_environment }} (${RELEASE_DATE})" \
+            "$BODY")
 
           RESPONSE=$(curl --insecure --silent -X POST \
             -H "Authorization: token ${{ secrets.GH_TOKEN }}" \

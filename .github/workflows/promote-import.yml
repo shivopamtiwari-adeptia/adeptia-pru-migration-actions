@@ -141,16 +141,10 @@ jobs:
           ### Rollback ZIPs
           ${{ steps.import.outputs.rollback_zips }}"
 
-          PAYLOAD=$(python3 -c "
-import json, sys
-print(json.dumps({
-  'tag_name': '$TAG',
-  'target_commitish': 'main',
-  'name': '${{ steps.config.outputs.package_base }} -> ${{ steps.import.outputs.imported_envs }} (${RELEASE_DATE})',
-  'body': sys.argv[1],
-  'draft': False,
-  'prerelease': False
-}))" "$BODY")
+          PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'tag_name':sys.argv[1],'target_commitish':'main','name':sys.argv[2],'body':sys.argv[3],'draft':False,'prerelease':False}))" \
+            "$TAG" \
+            "${{ steps.config.outputs.package_base }} -> ${{ steps.import.outputs.imported_envs }} (${RELEASE_DATE})" \
+            "$BODY")
 
           RESPONSE=$(curl --insecure --silent -X POST \
             -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
