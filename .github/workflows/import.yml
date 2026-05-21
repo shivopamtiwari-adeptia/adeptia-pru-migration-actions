@@ -1,0 +1,176 @@
+name: Import
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip_name:
+        description: 'ZIP filename to import (check artifacts/qa or artifacts/dev in repo)'
+        required: true
+        type: string
+      target_environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [QA, Stage, Production]
+
+jobs:
+  import:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: List available ZIPs
+        run: |
+          echo "=== Available ZIPs in artifacts/qa ==="
+          ls artifacts/qa/*.zip 2>/dev/null || echo "None"
+          echo "=== Available ZIPs in artifacts/dev ==="
+          ls artifacts/dev/*.zip 2>/dev/null || echo "None"
+
+      - name: Resolve paths
+        id: resolve
+        run: |
+          ZIP="${{ inputs.source_zip_name }}"
+          if [[ "$ZIP" == *-QA.zip ]]; then FOLDER="artifacts/qa"
+          elif [[ "$ZIP" == *-DEV.zip ]]; then FOLDER="artifacts/dev"
+          else echo "ZIP must end with -QA.zip or -DEV.zip"; exit 1; fi
+          PACKAGE_BASE="${ZIP%-QA.zip}"
+          PACKAGE_BASE="${PACKAGE_BASE%-DEV.zip}"
+          ROLLBACK_NAME="${PACKAGE_BASE}-${{ inputs.target_environment }}-rollback.zip"
+          echo "source_zip_path=${FOLDER}/${ZIP}"      >> $GITHUB_OUTPUT
+          echo "rollback_zip_name=$ROLLBACK_NAME"      >> $GITHUB_OUTPUT
+          echo "rollback_zip_path=rollback/$ROLLBACK_NAME" >> $GITHUB_OUTPUT
+          echo "package_base=$PACKAGE_BASE"            >> $GITHUB_OUTPUT
+
+      - name: Validate no duplicate import
+        run: |
+          MARKER="rollback/executed/${{ steps.resolve.outputs.rollback_zip_name }}.done"
+          if [ -f "$MARKER" ]; then
+            STATUS=$(curl --insecure --silent \
+              -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -o /dev/null -w "%{http_code}" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/${MARKER}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Duplicate import detected — already imported and not rolled back"; exit 1
+            fi
+          fi
+
+      - name: Login to Adeptia
+        id: login
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.ADEPTIA_IMPORT_USERNAME }}\",\"password\":\"${{ secrets.ADEPTIA_IMPORT_PASSWORD }}\"}" \
+            "${{ vars.IMPORT_APP_URL }}/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Trigger import
+        id: trigger
+        run: |
+          RESPONSE=$(curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            --form "sourceZipFile=@\"${{ steps.resolve.outputs.source_zip_path }}\"" \
+            --form "generateRollbackPackage=true" \
+            "${{ vars.IMPORT_APP_URL }}/rest/migration/import/execute/${{ vars.IMPORT_PKG_ID }}")
+          echo "Response: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Import triggered. Reference ID: $REF_ID"
+
+      - name: Poll import status
+        id: status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out"; exit 1; fi
+
+      - name: Download rollback ZIP
+        run: |
+          mkdir -p rollback
+          for i in $(seq 1 5); do
+            HTTP=$(curl --insecure --silent \
+              --cookie "ACCESS_TOKEN=${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/downloadzip?id=${{ steps.trigger.outputs.ref_id }}&type=rollbackzip" \
+              --output "${{ steps.resolve.outputs.rollback_zip_path }}" \
+              --write-out "%{http_code}")
+            echo "Attempt $i: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && break
+            [ $i -lt 5 ] && sleep 30
+          done
+
+      - name: Commit rollback ZIP
+        run: |
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git add "${{ steps.resolve.outputs.rollback_zip_path }}"
+          git diff --cached --quiet || (
+            git commit -m "rollback: ${{ steps.resolve.outputs.rollback_zip_name }} [imported ${{ inputs.source_zip_name }} to ${{ inputs.target_environment }}]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          )
+
+      - name: Create GitHub Release
+        run: |
+          RELEASE_DATE=$(date +%Y-%m-%d)
+          TAG="${{ steps.resolve.outputs.package_base }}-${{ inputs.target_environment }}"
+          BODY="## Migration Release
+
+| Field | Value |
+|---|---|
+| **Package** | ${{ steps.resolve.outputs.package_base }} |
+| **Imported To** | ${{ inputs.target_environment }} |
+| **Import Date** | ${RELEASE_DATE} |
+| **Source ZIP** | ${{ inputs.source_zip_name }} |
+| **Rollback ZIP** | ${{ steps.resolve.outputs.rollback_zip_name }} |
+| **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+### Rollback
+Run the **Rollback workflow** and enter: ${{ steps.resolve.outputs.rollback_zip_name }}"
+
+          PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+  'tag_name': '$TAG',
+  'target_commitish': 'main',
+  'name': '${{ steps.resolve.outputs.package_base }} -> ${{ inputs.target_environment }} (${RELEASE_DATE})',
+  'body': sys.argv[1],
+  'draft': False,
+  'prerelease': False
+}))" "$BODY")
+
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/releases")
+
+          RELEASE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+          RELEASE_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))")
+          echo "Release created: $RELEASE_URL"
+
+          curl --insecure --silent -X POST \
+            -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+            -H "Content-Type: application/zip" \
+            --data-binary @"${{ steps.resolve.outputs.source_zip_path }}" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=${{ inputs.source_zip_name }}" > /dev/null
+          echo "ZIP attached to release"

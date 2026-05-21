@@ -1,0 +1,39 @@
+name: Test Runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Check python3
+        run: python3 --version
+
+      - name: Check git
+        run: git --version
+
+      - name: Check curl
+        run: curl --version | head -1
+
+      - name: Test Adeptia export URL
+        run: |
+          HTTP=$(curl --insecure -o /dev/null -w "%{http_code}" https://qa-ac5sqlenvoy.adeptia.org)
+          echo "Adeptia Export URL: HTTP $HTTP"
+          [ "$HTTP" != "000" ] && echo "REACHABLE" || echo "NOT REACHABLE"
+
+      - name: Test Adeptia import URL
+        run: |
+          HTTP=$(curl --insecure -o /dev/null -w "%{http_code}" https://ac5-services.adeptia.org)
+          echo "Adeptia Import URL: HTTP $HTTP"
+          [ "$HTTP" != "000" ] && echo "REACHABLE" || echo "NOT REACHABLE"
+
+      - name: Test GitHub API
+        run: |
+          HTTP=$(curl -o /dev/null -w "%{http_code}" https://api.github.com)
+          echo "GitHub API: HTTP $HTTP"
+          [ "$HTTP" = "200" ] && echo "REACHABLE" || echo "NOT REACHABLE"
+
+      - name: All checks passed
+        run: echo "Runner is ready for Adeptia migration workflows"

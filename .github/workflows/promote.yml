@@ -1,0 +1,178 @@
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_type:
+        description: 'Change type prefix'
+        required: true
+        type: choice
+        options: [SOL, MAP, LIB, DB, HF]
+      module_name:
+        description: 'Short module name e.g. PaymentIngestion'
+        required: true
+        type: string
+      package_version:
+        description: 'Semantic version e.g. v1.2.0'
+        required: true
+        type: string
+      export_environment:
+        description: 'DEV = source export | QA = Golden ZIP'
+        required: true
+        type: choice
+        options: [DEV, QA]
+      export_package_id:
+        description: 'Export package ID from Adeptia Migration Manager'
+        required: true
+        type: string
+      import_to_qa:
+        description: 'Import to QA'
+        required: true
+        type: boolean
+        default: true
+      import_to_stage:
+        description: 'Import to Stage'
+        required: true
+        type: boolean
+        default: false
+      import_to_production:
+        description: 'Import to Production'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  promote:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Resolve parameters
+        id: resolve
+        run: |
+          VERSION="${{ inputs.package_version }}"
+          [[ "$VERSION" != v* ]] && VERSION="v$VERSION"
+          BUILD_DATE=$(date +%Y%m%d)
+          PACKAGE_BASE="${{ inputs.package_type }}-${{ inputs.module_name }}-${VERSION}-B${{ github.run_number }}-${BUILD_DATE}"
+          ZIP_NAME="${PACKAGE_BASE}-${{ inputs.export_environment }}.zip"
+          ZIP_FOLDER="artifacts/$(echo '${{ inputs.export_environment }}' | tr '[:upper:]' '[:lower:]')"
+          ZIP_PATH="${ZIP_FOLDER}/${ZIP_NAME}"
+          PR_BRANCH="migration/${PACKAGE_BASE}"
+
+          # Build target envs list in order
+          ENVS=""
+          [ "${{ inputs.import_to_qa }}"         = "true" ] && ENVS="${ENVS}QA,"
+          [ "${{ inputs.import_to_stage }}"       = "true" ] && ENVS="${ENVS}Stage,"
+          [ "${{ inputs.import_to_production }}"  = "true" ] && ENVS="${ENVS}Production,"
+          ENVS="${ENVS%,}"
+
+          if [ -z "$ENVS" ]; then echo "Select at least one target environment"; exit 1; fi
+
+          echo "package_base=$PACKAGE_BASE" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME"         >> $GITHUB_OUTPUT
+          echo "zip_folder=$ZIP_FOLDER"     >> $GITHUB_OUTPUT
+          echo "zip_path=$ZIP_PATH"         >> $GITHUB_OUTPUT
+          echo "pr_branch=$PR_BRANCH"       >> $GITHUB_OUTPUT
+          echo "target_envs=$ENVS"          >> $GITHUB_OUTPUT
+          echo "Package   : $PACKAGE_BASE"
+          echo "Artifact  : $ZIP_PATH"
+          echo "PR Branch : $PR_BRANCH"
+          echo "Target Envs: $ENVS"
+
+      - name: Login to Adeptia
+        id: login
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.ADEPTIA_EXPORT_USERNAME }}\",\"password\":\"${{ secrets.ADEPTIA_EXPORT_PASSWORD }}\",\"requestFrom\":\"web\"}" \
+            "${{ vars.EXPORT_APP_URL }}/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Trigger export
+        id: trigger
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            "${{ vars.EXPORT_APP_URL }}/rest/migration/export/execute/${{ inputs.export_package_id }}")
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ -z "$REF_ID" ]; then echo "Export trigger failed: $RESPONSE"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Export triggered. Reference ID: $REF_ID"
+
+      - name: Poll export status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+              "${{ vars.EXPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then sleep 10; break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Export timed out"; exit 1; fi
+
+      - name: Download export ZIP
+        run: |
+          mkdir -p "${{ steps.resolve.outputs.zip_folder }}"
+          curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            "${{ vars.EXPORT_APP_URL }}/rest/migration/downloadzip?id=${{ steps.trigger.outputs.ref_id }}&type=exportzip" \
+            --output "${{ steps.resolve.outputs.zip_path }}"
+          echo "Downloaded: ${{ steps.resolve.outputs.zip_name }}"
+
+      - name: Commit to PR branch and create PR
+        run: |
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git checkout -b "${{ steps.resolve.outputs.pr_branch }}"
+
+          # Write promote config
+          echo "ZIP_PATH=${{ steps.resolve.outputs.zip_path }}"   > promote-config.txt
+          echo "TARGET_ENVS=${{ steps.resolve.outputs.target_envs }}" >> promote-config.txt
+
+          git add "${{ steps.resolve.outputs.zip_path }}" promote-config.txt
+          git commit -m "promote: ${{ steps.resolve.outputs.zip_name }} -> ${{ steps.resolve.outputs.target_envs }} [run ${{ github.run_number }}]"
+          git push origin HEAD:"${{ steps.resolve.outputs.pr_branch }}"
+
+          # Create PR
+          PR_BODY="## Promote Package
+
+| Field | Value |
+|---|---|
+| **Package** | ${{ steps.resolve.outputs.package_base }} |
+| **Export Env** | ${{ inputs.export_environment }} |
+| **Target Envs** | ${{ steps.resolve.outputs.target_envs }} |
+| **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+Merge this PR to trigger automatic import to: ${{ steps.resolve.outputs.target_envs }}"
+
+          PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+  'title': 'Promote: ${{ steps.resolve.outputs.package_base }} -> ${{ steps.resolve.outputs.target_envs }}',
+  'head':  '${{ steps.resolve.outputs.pr_branch }}',
+  'base':  'main',
+  'body':  sys.argv[1]
+}))" "$PR_BODY")
+
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+
+          PR_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))")
+          echo "Pull Request created: $PR_URL"
+          echo "Merge the PR to trigger automatic import to: ${{ steps.resolve.outputs.target_envs }}"

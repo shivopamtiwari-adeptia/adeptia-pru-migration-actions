@@ -1,0 +1,107 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip_name:
+        description: 'Rollback ZIP filename (check rollback/ folder in repo)'
+        required: true
+        type: string
+      target_environment:
+        description: 'Same environment used during import'
+        required: true
+        type: choice
+        options: [QA, Stage, Production]
+
+jobs:
+  rollback:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: List available rollback ZIPs
+        run: |
+          echo "=== Available rollback ZIPs ==="
+          ls rollback/*.zip 2>/dev/null || echo "None"
+
+      - name: Validate ZIP and environment
+        id: resolve
+        run: |
+          ZIP="${{ inputs.source_zip_name }}"
+          if [[ "$ZIP" != *-rollback.zip ]]; then echo "ZIP must end with -rollback.zip"; exit 1; fi
+
+          # Environment mismatch guard
+          if [[ "$ZIP" == *-QA-rollback.zip ]] && [ "${{ inputs.target_environment }}" != "QA" ]; then
+            echo "Environment mismatch: ZIP is for QA but target is ${{ inputs.target_environment }}"; exit 1
+          fi
+          if [[ "$ZIP" == *-Stage-rollback.zip ]] && [ "${{ inputs.target_environment }}" != "Stage" ]; then
+            echo "Environment mismatch: ZIP is for Stage but target is ${{ inputs.target_environment }}"; exit 1
+          fi
+          if [[ "$ZIP" == *-Production-rollback.zip ]] && [ "${{ inputs.target_environment }}" != "Production" ]; then
+            echo "Environment mismatch: ZIP is for Production but target is ${{ inputs.target_environment }}"; exit 1
+          fi
+
+          MARKER="rollback/executed/${ZIP}.done"
+          if [ -f "$MARKER" ]; then
+            echo "Duplicate rollback detected — already executed for ${{ inputs.target_environment }}"; exit 1
+          fi
+
+          echo "rollback_zip_path=rollback/$ZIP" >> $GITHUB_OUTPUT
+          echo "marker_path=$MARKER"             >> $GITHUB_OUTPUT
+
+      - name: Login to Adeptia
+        id: login
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.ADEPTIA_IMPORT_USERNAME }}\",\"password\":\"${{ secrets.ADEPTIA_IMPORT_PASSWORD }}\"}" \
+            "${{ vars.IMPORT_APP_URL }}/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Trigger rollback
+        id: trigger
+        run: |
+          RESPONSE=$(curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            --form "sourceZipFile=@\"${{ steps.resolve.outputs.rollback_zip_path }}\"" \
+            "${{ vars.IMPORT_APP_URL }}/rest/migration/rollback/execute/${{ vars.IMPORT_PKG_ID }}")
+          echo "Response: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Rollback trigger failed"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Rollback triggered. Reference ID: $REF_ID"
+
+      - name: Poll rollback status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Rollback timed out"; exit 1; fi
+
+      - name: Mark rollback executed
+        run: |
+          mkdir -p rollback/executed
+          echo "executed: ${{ inputs.source_zip_name }} on ${{ inputs.target_environment }} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "${{ steps.resolve.outputs.marker_path }}"
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git add "${{ steps.resolve.outputs.marker_path }}"
+          git commit -m "rollback-executed: ${{ inputs.source_zip_name }} on ${{ inputs.target_environment }}"
+          git pull --rebase origin main
+          git push origin HEAD:main

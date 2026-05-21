@@ -1,0 +1,117 @@
+name: Export
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_type:
+        description: 'Change type prefix'
+        required: true
+        type: choice
+        options: [SOL, MAP, LIB, DB, HF]
+      module_name:
+        description: 'Short module name e.g. PaymentIngestion'
+        required: true
+        type: string
+      package_version:
+        description: 'Semantic version e.g. v1.2.0'
+        required: true
+        type: string
+      export_environment:
+        description: 'DEV = source export | QA = Golden ZIP'
+        required: true
+        type: choice
+        options: [DEV, QA]
+      export_package_id:
+        description: 'Export package ID from Adeptia Migration Manager'
+        required: true
+        type: string
+
+jobs:
+  export:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Resolve artifact name
+        id: resolve
+        run: |
+          VERSION="${{ inputs.package_version }}"
+          [[ "$VERSION" != v* ]] && VERSION="v$VERSION"
+          BUILD_DATE=$(date +%Y%m%d)
+          PACKAGE_BASE="${{ inputs.package_type }}-${{ inputs.module_name }}-${VERSION}-B${{ github.run_number }}-${BUILD_DATE}"
+          ZIP_NAME="${PACKAGE_BASE}-${{ inputs.export_environment }}.zip"
+          ZIP_FOLDER="artifacts/$(echo '${{ inputs.export_environment }}' | tr '[:upper:]' '[:lower:]')"
+          ZIP_PATH="${ZIP_FOLDER}/${ZIP_NAME}"
+          echo "package_base=$PACKAGE_BASE" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME"         >> $GITHUB_OUTPUT
+          echo "zip_folder=$ZIP_FOLDER"     >> $GITHUB_OUTPUT
+          echo "zip_path=$ZIP_PATH"         >> $GITHUB_OUTPUT
+          echo "Package : $PACKAGE_BASE"
+          echo "Artifact: $ZIP_PATH"
+
+      - name: Login to Adeptia
+        id: login
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.ADEPTIA_EXPORT_USERNAME }}\",\"password\":\"${{ secrets.ADEPTIA_EXPORT_PASSWORD }}\",\"requestFrom\":\"web\"}" \
+            "${{ vars.EXPORT_APP_URL }}/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "Login successful"
+
+      - name: Trigger export
+        id: trigger
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            "${{ vars.EXPORT_APP_URL }}/rest/migration/export/execute/${{ inputs.export_package_id }}")
+          echo "Response: $RESPONSE"
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ -z "$REF_ID" ]; then echo "Export trigger failed"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Export triggered. Reference ID: $REF_ID"
+
+      - name: Poll export status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+              "${{ vars.EXPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then sleep 10; break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Export timed out"; exit 1; fi
+
+      - name: Download export ZIP
+        run: |
+          mkdir -p "${{ steps.resolve.outputs.zip_folder }}"
+          curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            "${{ vars.EXPORT_APP_URL }}/rest/migration/downloadzip?id=${{ steps.trigger.outputs.ref_id }}&type=exportzip" \
+            --output "${{ steps.resolve.outputs.zip_path }}"
+          echo "Downloaded: ${{ steps.resolve.outputs.zip_name }}"
+
+      - name: Commit ZIP to GitHub
+        run: |
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git add "${{ steps.resolve.outputs.zip_path }}"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "export: ${{ steps.resolve.outputs.zip_name }} [run ${{ github.run_number }}]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
