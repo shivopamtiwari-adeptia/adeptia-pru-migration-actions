@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_zip_name:
-        description: 'ZIP filename to import (check artifacts/qa or artifacts/dev in repo)'
+        description: 'ZIP filename to import (from artifacts/dev or artifacts/qa folder)'
         required: true
         type: string
       target_environment:
