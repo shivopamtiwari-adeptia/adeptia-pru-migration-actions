@@ -1,0 +1,2 @@
+ZIP_PATH=artifacts/dev/SOL-training_promote-v1.0-B6-20260601-DEV.zip
+TARGET_ENVS=QA
