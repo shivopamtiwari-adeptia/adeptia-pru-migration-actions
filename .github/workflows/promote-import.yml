@@ -6,11 +6,14 @@ on:
     branches: [main]
 
 jobs:
-  promote-import:
+  setup:
     if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'migration/')
     runs-on: self-hosted
-    timeout-minutes: 60
-
+    outputs:
+      zip_path: ${{ steps.config.outputs.zip_path }}
+      zip_name: ${{ steps.config.outputs.zip_name }}
+      package_base: ${{ steps.config.outputs.package_base }}
+      target_envs: ${{ steps.config.outputs.target_envs }}
     steps:
       - name: Checkout main
         uses: actions/checkout@v5
@@ -35,6 +38,19 @@ jobs:
           echo "ZIP Path   : $ZIP_PATH"
           echo "Target Envs: $TARGET_ENVS"
 
+  import-qa:
+    needs: setup
+    if: always() && needs.setup.result == 'success' && contains(needs.setup.outputs.target_envs, 'QA')
+    runs-on: self-hosted
+    environment: QA
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          ref: main
+
       - name: Login to Adeptia
         id: login
         run: |
@@ -48,102 +64,250 @@ jobs:
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
           echo "Login successful"
 
-      - name: Import to environments sequentially
-        id: import
+      - name: Trigger import
+        id: trigger
         run: |
-          IFS=',' read -ra ENVS <<< "${{ steps.config.outputs.target_envs }}"
-          IMPORTED_ENVS=""
-          ROLLBACK_ZIPS=""
+          RESPONSE=$(curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            --form "sourceZipFile=@\"${{ needs.setup.outputs.zip_path }}\"" \
+            --form "generateRollbackPackage=true" \
+            "${{ vars.IMPORT_APP_URL }}/rest/migration/import/execute/${{ vars.IMPORT_PKG_ID }}")
+          echo "Response: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed for QA: $RESPONSE"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Import triggered. Reference ID: $REF_ID"
 
-          git config user.name "github-actions"
-          git config user.email "ci-service@adeptia.com"
-
-          for ENV in "${ENVS[@]}"; do
-            ENV=$(echo "$ENV" | xargs)
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Starting import to: $ENV"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-            # Trigger import
+      - name: Poll import status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
             RESPONSE=$(curl --insecure --silent \
               -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
-              --form "sourceZipFile=@\"${{ steps.config.outputs.zip_path }}\"" \
-              --form "generateRollbackPackage=true" \
-              "${{ vars.IMPORT_APP_URL }}/rest/migration/import/execute/${{ vars.IMPORT_PKG_ID }}")
-            echo "Import response [$ENV]: $RESPONSE"
-
-            SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
-            REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
-
-            if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then
-              echo "Import trigger failed for $ENV"; exit 1
-            fi
-
-            # Poll status
-            STATUS=""
-            for i in $(seq 1 15); do
-              RESPONSE=$(curl --insecure --silent \
-                -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
-                "${{ vars.IMPORT_APP_URL }}/rest/migration/status?id=$REF_ID")
-              STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
-              echo "Attempt $i/15 [$ENV]: $STATUS"
-              if [ "$STATUS" = "FINISHED" ]; then break; fi
-              [ $i -lt 15 ] && sleep 30
-            done
-
-            if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for $ENV"; exit 1; fi
-
-            # Download rollback ZIP
-            ROLLBACK_NAME="${{ steps.config.outputs.package_base }}-${ENV}-rollback.zip"
-            ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
-            mkdir -p rollback
-            for r in $(seq 1 5); do
-              HTTP=$(curl --insecure --silent \
-                --cookie "ACCESS_TOKEN=${{ steps.login.outputs.token }}" \
-                "${{ vars.IMPORT_APP_URL }}/rest/migration/downloadzip?id=${REF_ID}&type=rollbackzip" \
-                --output "$ROLLBACK_PATH" --write-out "%{http_code}")
-              echo "Rollback download attempt $r: HTTP $HTTP"
-              [ "$HTTP" = "200" ] && break
-              [ $r -lt 5 ] && sleep 30
-            done
-
-            # Commit rollback ZIP
-            git add "$ROLLBACK_PATH"
-            git diff --cached --quiet || (
-              git commit -m "rollback: ${ROLLBACK_NAME} [promoted to ${ENV}]"
-              git pull --rebase origin main
-              git push origin HEAD:main
-            )
-
-            IMPORTED_ENVS="${IMPORTED_ENVS}${ENV}, "
-            ROLLBACK_ZIPS="${ROLLBACK_ZIPS}- ${ROLLBACK_PATH}\n"
-            echo "Import to $ENV SUCCEEDED"
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15 [QA]: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then break; fi
+            [ $i -lt 15 ] && sleep 30
           done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for QA"; exit 1; fi
 
-          echo "imported_envs=${IMPORTED_ENVS%, }" >> $GITHUB_OUTPUT
-          echo "rollback_zips=$ROLLBACK_ZIPS"      >> $GITHUB_OUTPUT
+      - name: Download and commit rollback ZIP
+        run: |
+          ROLLBACK_NAME="${{ needs.setup.outputs.package_base }}-QA-rollback.zip"
+          ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
+          mkdir -p rollback
+          for r in $(seq 1 5); do
+            HTTP=$(curl --insecure --silent \
+              --cookie "ACCESS_TOKEN=${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/downloadzip?id=${{ steps.trigger.outputs.ref_id }}&type=rollbackzip" \
+              --output "$ROLLBACK_PATH" --write-out "%{http_code}")
+            echo "Rollback download attempt $r: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && break
+            [ $r -lt 5 ] && sleep 30
+          done
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git add "$ROLLBACK_PATH"
+          git diff --cached --quiet || (
+            git commit -m "rollback: ${ROLLBACK_NAME} [promoted to QA]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          )
+
+  import-stage:
+    needs: [setup, import-qa]
+    if: always() && needs.setup.result == 'success' && contains(needs.setup.outputs.target_envs, 'Stage') && (needs.import-qa.result == 'success' || needs.import-qa.result == 'skipped')
+    runs-on: self-hosted
+    environment: Stage
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          ref: main
+
+      - name: Login to Adeptia
+        id: login
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.ADEPTIA_IMPORT_USERNAME }}\",\"password\":\"${{ secrets.ADEPTIA_IMPORT_PASSWORD }}\"}" \
+            "${{ vars.IMPORT_APP_URL }}/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "Login successful"
+
+      - name: Trigger import
+        id: trigger
+        run: |
+          RESPONSE=$(curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            --form "sourceZipFile=@\"${{ needs.setup.outputs.zip_path }}\"" \
+            --form "generateRollbackPackage=true" \
+            "${{ vars.IMPORT_APP_URL }}/rest/migration/import/execute/${{ vars.IMPORT_PKG_ID }}")
+          echo "Response: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed for Stage: $RESPONSE"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Import triggered. Reference ID: $REF_ID"
+
+      - name: Poll import status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15 [Stage]: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for Stage"; exit 1; fi
+
+      - name: Download and commit rollback ZIP
+        run: |
+          ROLLBACK_NAME="${{ needs.setup.outputs.package_base }}-Stage-rollback.zip"
+          ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
+          mkdir -p rollback
+          for r in $(seq 1 5); do
+            HTTP=$(curl --insecure --silent \
+              --cookie "ACCESS_TOKEN=${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/downloadzip?id=${{ steps.trigger.outputs.ref_id }}&type=rollbackzip" \
+              --output "$ROLLBACK_PATH" --write-out "%{http_code}")
+            echo "Rollback download attempt $r: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && break
+            [ $r -lt 5 ] && sleep 30
+          done
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git add "$ROLLBACK_PATH"
+          git diff --cached --quiet || (
+            git commit -m "rollback: ${ROLLBACK_NAME} [promoted to Stage]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          )
+
+  import-production:
+    needs: [setup, import-qa, import-stage]
+    if: always() && needs.setup.result == 'success' && contains(needs.setup.outputs.target_envs, 'Production') && (needs.import-qa.result == 'success' || needs.import-qa.result == 'skipped') && (needs.import-stage.result == 'success' || needs.import-stage.result == 'skipped')
+    runs-on: self-hosted
+    environment: Production
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          ref: main
+
+      - name: Login to Adeptia
+        id: login
+        run: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.ADEPTIA_IMPORT_USERNAME }}\",\"password\":\"${{ secrets.ADEPTIA_IMPORT_PASSWORD }}\"}" \
+            "${{ vars.IMPORT_APP_URL }}/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "Login successful"
+
+      - name: Trigger import
+        id: trigger
+        run: |
+          RESPONSE=$(curl --insecure --silent \
+            -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+            --form "sourceZipFile=@\"${{ needs.setup.outputs.zip_path }}\"" \
+            --form "generateRollbackPackage=true" \
+            "${{ vars.IMPORT_APP_URL }}/rest/migration/import/execute/${{ vars.IMPORT_PKG_ID }}")
+          echo "Response: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed for Production: $RESPONSE"; exit 1; fi
+          echo "ref_id=$REF_ID" >> $GITHUB_OUTPUT
+          echo "Import triggered. Reference ID: $REF_ID"
+
+      - name: Poll import status
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: ${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/status?id=${{ steps.trigger.outputs.ref_id }}")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15 [Production]: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for Production"; exit 1; fi
+
+      - name: Download and commit rollback ZIP
+        run: |
+          ROLLBACK_NAME="${{ needs.setup.outputs.package_base }}-Production-rollback.zip"
+          ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
+          mkdir -p rollback
+          for r in $(seq 1 5); do
+            HTTP=$(curl --insecure --silent \
+              --cookie "ACCESS_TOKEN=${{ steps.login.outputs.token }}" \
+              "${{ vars.IMPORT_APP_URL }}/rest/migration/downloadzip?id=${{ steps.trigger.outputs.ref_id }}&type=rollbackzip" \
+              --output "$ROLLBACK_PATH" --write-out "%{http_code}")
+            echo "Rollback download attempt $r: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && break
+            [ $r -lt 5 ] && sleep 30
+          done
+          git config user.name "github-actions"
+          git config user.email "ci-service@adeptia.com"
+          git add "$ROLLBACK_PATH"
+          git diff --cached --quiet || (
+            git commit -m "rollback: ${ROLLBACK_NAME} [promoted to Production]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          )
+
+  create-release:
+    needs: [setup, import-qa, import-stage, import-production]
+    if: always() && needs.setup.result == 'success' && (needs.import-qa.result == 'success' || needs.import-qa.result == 'skipped') && (needs.import-stage.result == 'success' || needs.import-stage.result == 'skipped') && (needs.import-production.result == 'success' || needs.import-production.result == 'skipped') && (needs.import-qa.result == 'success' || needs.import-stage.result == 'success' || needs.import-production.result == 'success')
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          ref: main
 
       - name: Create GitHub Release
         run: |
           RELEASE_DATE=$(date +%Y-%m-%d)
-          TAG="${{ steps.config.outputs.package_base }}-release-${RELEASE_DATE}"
+          IMPORTED_ENVS=""
+          [ "${{ needs.import-qa.result }}" = "success" ]         && IMPORTED_ENVS="${IMPORTED_ENVS}QA, "
+          [ "${{ needs.import-stage.result }}" = "success" ]      && IMPORTED_ENVS="${IMPORTED_ENVS}Stage, "
+          [ "${{ needs.import-production.result }}" = "success" ] && IMPORTED_ENVS="${IMPORTED_ENVS}Production, "
+          IMPORTED_ENVS="${IMPORTED_ENVS%, }"
+
+          TAG="${{ needs.setup.outputs.package_base }}-release-${RELEASE_DATE}"
 
           BODY="## Migration Release
 
           | Field | Value |
           |---|---|
-          | **Package** | ${{ steps.config.outputs.package_base }} |
-          | **Environments** | ${{ steps.import.outputs.imported_envs }} |
+          | **Package** | ${{ needs.setup.outputs.package_base }} |
+          | **Environments** | ${IMPORTED_ENVS} |
           | **Release Date** | ${RELEASE_DATE} |
           | **PR** | [${{ github.event.pull_request.html_url }}](${{ github.event.pull_request.html_url }}) |
-          | **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
-
-          ### Rollback ZIPs
-          ${{ steps.import.outputs.rollback_zips }}"
+          | **Run** | [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
 
           PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'tag_name':sys.argv[1],'target_commitish':'main','name':sys.argv[2],'body':sys.argv[3],'draft':False,'prerelease':False}))" \
             "$TAG" \
-            "${{ steps.config.outputs.package_base }} -> ${{ steps.import.outputs.imported_envs }} (${RELEASE_DATE})" \
+            "${{ needs.setup.outputs.package_base }} -> ${IMPORTED_ENVS} (${RELEASE_DATE})" \
             "$BODY")
 
           RESPONSE=$(curl --insecure --silent -X POST \
@@ -160,6 +324,6 @@ jobs:
           curl --insecure --silent -X POST \
             -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
             -H "Content-Type: application/zip" \
-            --data-binary @"${{ steps.config.outputs.zip_path }}" \
-            "https://uploads.github.com/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=${{ steps.config.outputs.zip_name }}" > /dev/null
+            --data-binary @"${{ needs.setup.outputs.zip_path }}" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=${{ needs.setup.outputs.zip_name }}" > /dev/null
           echo "ZIP attached to release"

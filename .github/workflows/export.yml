@@ -29,6 +29,7 @@ on:
 jobs:
   export:
     runs-on: self-hosted
+    environment: ${{ inputs.export_environment }}
     timeout-minutes: 60
 
     steps:
